@@ -1,0 +1,597 @@
+---
+title: "Team_1_HW3"
+author: "HW Team 1"
+date: "2025-09-10"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Bring in the binned data
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(mgcv)
+
+```
+
+#read in the data
+
+Training
+
+```{r}
+df_train <- read.csv("C:/Users/johnc/Downloads/Pesonal/IAA/Fall/Stats/HW2/insurance_t_bin.csv")
+
+View(df_train)
+```
+
+Validation
+
+```{r}
+df_validate <- read.csv("C:/Users/johnc/Downloads/Pesonal/IAA/Fall/Stats/HW 3/insurance_v_bin.csv")
+
+View(df_validate)
+```
+
+#fix missing values (Training data)
+
+```{r}
+df_train_v2 <- df_train
+
+# replace missing values 
+replace_missing <- function(x){
+  x[is.na(x)] <-"missing"
+  return(x)
+}
+
+# apply the above function to all the columns
+df_train_v2 <- df_train_v2 %>% 
+  mutate(across(everything(),replace_missing))
+
+print(df_train_v2)
+
+View(df_train_v2)
+```
+
+# fix missing values for Validation set
+
+```{r}
+df_validate_v2 <- df_validate
+
+# replace missing values 
+replace_missing <- function(x){
+  x[is.na(x)] <-"missing"
+  return(x)
+}
+
+# apply the above function to all the columns
+df_validate_v2 <- df_validate_v2 %>% 
+  mutate(across(everything(),replace_missing))
+
+#print(df_validate_v2)
+
+View(df_validate_v2)
+```
+
+# Training Data: - Fix the linear separation issues we had in HW 2 for CASHBK and MMCRED
+
+Fix MMCRED
+
+```{r}
+
+df_train_v2$MMCRED <- as.character(df_train_v2$MMCRED)
+
+# here we are combining the 2,3,5 values in to one level 2+
+df_train_v2$MMCRED[which(df_train_v2$MMCRED >= 2)] <- "2+" 
+
+# here we are re creating the linear separtion matrix for MMCRED
+table(df_train_v2$MMCRED,df_train_v2$INS) 
+```
+
+Fix CASHBK
+
+```{r}
+df_train_v2$CASHBK <- as.character(df_train_v2$CASHBK)
+
+# here we are combining the 1 and 2 levels in to one level 1+
+df_train_v2$CASHBK[which(df_train_v2$CASHBK >=1)] <- "1+" 
+
+# here we are re creating the linear separation matrix for CASHBK
+table(df_train_v2$CASHBK,df_train_v2$INS) 
+```
+
+# Validation Data: Fix Linear Separation Issues
+
+Fix MMCRED - In validation
+
+```{r}
+
+df_validate_v2$MMCRED <- as.character(df_validate_v2$MMCRED)
+
+# here we are combining the 2,3,5 values in to one level 2+
+df_validate_v2$MMCRED[which(df_validate_v2$MMCRED >= 2)] <- "2+" 
+
+# here we are re creating the linear separtion matrix for MMCRED
+table(df_validate_v2$MMCRED,df_validate_v2$INS) 
+```
+
+Fix CASHBK - in Validation
+
+```{r}
+df_validate_v2$CASHBK <- as.character(df_validate_v2$CASHBK)
+
+# here we are combining the 1 and 2 levels in to one level 1+
+df_validate_v2$CASHBK[which(df_validate_v2$CASHBK >=1)] <- "1+" 
+
+# here we are re creating the linear separation matrix for CASHBK
+table(df_validate_v2$CASHBK,df_validate_v2$INS) 
+```
+
+#create a full model with all variables
+
+```{r}
+full.model <- glm(factor(INS)~.,
+                  data=df_train_v2,
+                  family = binomial(link="logit"),
+                  )
+
+car::Anova(full.model,test='LR',type='III',singular.ok = TRUE)
+```
+
+From the model summary we see the NA variable are the aliased variables
+
+```{r}
+alias(full.model)
+```
+
+Aliased variables:
+CC-CCPURC-BRANCH-POS_BIN-POSAMT_BIN-INVBAL_BIN-CCBAL_BIN-LORES_BIN-HMVAL_BIN
+
+removed since aliased variables have perfect multicolinearity
+
+```{r}
+full.model_v2 <- glm(factor(INS)~.-CC-CCPURC-BRANCH-POS_BIN-POSAMT_BIN-INVBAL_BIN-CCBAL_BIN-LORES_BIN-HMVAL_BIN-PHONE_BIN, # removed DDA
+                  data=df_train_v2,
+                  family = binomial(link="logit"),
+                  )
+```
+
+#Now Look for multicolinearity using GVIF
+
+```{r}
+alias(full.model_v2)
+```
+
+# check for multicolinearity GVIF
+
+```{r}
+library(car)
+
+vif(full.model_v2)
+```
+
+# itteration 2: removed MMBAL_BIN
+
+```{r}
+full.model_v3 <- glm(factor(INS)~.-CC-CCPURC-BRANCH-POS_BIN-POSAMT_BIN-INVBAL_BIN-CCBAL_BIN-LORES_BIN-HMVAL_BIN-PHONE_BIN-MMBAL_BIN, # removed DDA
+                  data=df_train_v2,
+                  family = binomial(link="logit"),
+                  )
+
+#LRT
+#car::Anova(full.model_v2,test='LR',type='III',singular.ok = TRUE)
+```
+
+```{r}
+library(car)
+
+vif(full.model_v3)
+```
+
+# Itteration 3: remove ILS
+
+```{r}
+full.model_v4 <- glm(factor(INS)~.-CC-CCPURC-BRANCH-POS_BIN-POSAMT_BIN-INVBAL_BIN-CCBAL_BIN-LORES_BIN-HMVAL_BIN-PHONE_BIN-MMBAL_BIN-ILS,
+                  data=df_train_v2,
+                  family = binomial(link="logit"),
+                  )
+
+
+car::vif(full.model_v4)
+```
+
+# Itteration 4: remove DDA
+
+```{r}
+full.model_v5 <- glm(factor(INS)~.-CC-CCPURC-BRANCH-POS_BIN-POSAMT_BIN-INVBAL_BIN-CCBAL_BIN-LORES_BIN-HMVAL_BIN-PHONE_BIN-MMBAL_BIN-ILS-DDA,
+                  data=df_train_v2,
+                  family = binomial(link="logit"),
+                  )
+
+
+car::vif(full.model_v5)
+```
+
+# Itteration 5: remove SAV
+
+```{r}
+full.model_v6 <- glm(factor(INS)~.-CC-CCPURC-BRANCH-POS_BIN-POSAMT_BIN-INVBAL_BIN-CCBAL_BIN-LORES_BIN-HMVAL_BIN-PHONE_BIN-MMBAL_BIN-ILS-DDA-SAV,
+                  data=df_train_v2,
+                  family = binomial(link="logit"),
+                  )
+
+
+car::vif(full.model_v6)
+```
+
+# Itteration 6: remove CD
+
+```{r}
+full.model_v7 <- glm(factor(INS)~.-CC-CCPURC-BRANCH-POS_BIN-POSAMT_BIN-INVBAL_BIN-CCBAL_BIN-LORES_BIN-HMVAL_BIN-PHONE_BIN-MMBAL_BIN-ILS-DDA-SAV-CD,
+                  data=df_train_v2,
+                  family = binomial(link="logit"),
+                  )
+
+
+car::vif(full.model_v7)
+```
+
+Now all values with GVIF \> 5 have been removed to remove the
+multicolinearity
+
+# Reduced model to run forward, backward, and stepwise selection on
+
+```{r}
+#glm(formula = INS ~ . - CC - CCPURC - BRANCH - PHONE_BIN - POS_BIN - 
+#    POSAMT_BIN - INVBAL_BIN - CCBAL_BIN - LORES_BIN - HMVAL_BIN - 
+#    MMBAL_BIN - ILS - DDA - SAV - CD, family = binomial(link = "logit"), 
+#    data = training)
+
+```
+
+# Setpwise selection:
+
+```{r}
+# full model 
+full.model_final <- glm(factor(INS)~.- CC - CCPURC - BRANCH - PHONE_BIN - POS_BIN -POSAMT_BIN - INVBAL_BIN - CCBAL_BIN - LORES_BIN - HMVAL_BIN - MMBAL_BIN - ILS - DDA - SAV - CD,
+                  data = df_train_v2,
+                  family = binomial(link="logit"))
+
+
+#only contains the intercept
+empty.model <- glm(factor(INS)~1,
+                   data = df_train_v2,
+                   family = binomial(link = "logit"))
+
+
+#step model - steps through the model and adds or removes variables 
+step.model_1 <- step(empty.model,
+                   scope = list(lower=formula(empty.model),
+                                upper=formula(full.model_final)),
+                   direction = "both",
+                   k=log(nrow(df_train_v2))) # BIC selection 
+
+```
+
+#step-wise model Model from the step wise selection using BIC
+
+Step: AIC=9046.92 factor(INS)\~ SAVBAL_BIN + DDABAL_BIN + CDBAL_BIN +
+MM + INV + CHECKS_BIN + ATMAMT_BIN + TELLER_BIN + IRA + ILSBAL_BIN
+
+# code - forward selection for interaction terms
+
+```{r}
+# the main model contains all the predictor variables from the model above. 
+
+#empty = no interaction terms 
+step.model_1 <- glm(factor(INS)~SAVBAL_BIN + DDABAL_BIN + CDBAL_BIN + MM + INV + CHECKS_BIN + ATMAMT_BIN + TELLER_BIN + IRA + ILSBAL_BIN,
+                  data=df_train_v2,
+                  family = binomial(link="logit"),
+                  )
+
+# add the interaction model
+# we square the values because it will multiply all the variables to themselves which will create the interaction terms 
+
+#model with interaction tersm 
+interaction.model <-glm(factor(INS)~(SAVBAL_BIN + DDABAL_BIN + CDBAL_BIN + MM + INV + CHECKS_BIN + ATMAMT_BIN + TELLER_BIN + IRA + ILSBAL_BIN)^2,
+                       data = df_train_v2,
+                       family = binomial(link="logit"))
+
+
+Interaction_V1.model <- step(step.model_1,
+                  scope = list(lower=formula(step.model_1),
+                               upper=formula(interaction.model)),
+                  direction = "forward",
+                  k=log(nrow(df_train_v2))) # BIC
+                
+                  # p_value approach: k=qchisq(0.002,1,lower.tail = FALSE)), 
+                  # BIC: k=log(nrow(df_train_v2))),  
+                  # AIC: K=2
+
+# forward selection was used to find interaction terms so the model can select which interaction terms are more influential
+```
+
+No interaction terms found so just use step.model_1
+
+# run LRT to show the P-values for the variables used in the model:
+
+```{r}
+car::Anova(step.model_1,test='LR',type='III',singular.ok = TRUE)
+```
+
+# The summary shows the p-values for each level of the variables
+
+```{r}
+summary(step.model_1)
+```
+
+------------------------------------------------------------------------
+
+#Model Comparision values
+
+AIC for the interaction model AIC = 8848.6 BIC=9046.9 R\^2 = 0.307
+
+```{r}
+AIC(step.model_1)
+```
+
+BIC for interaction model
+
+```{r}
+BIC(step.model_1)
+```
+
+Pseudo R2 = 0.307
+
+```{r}
+library(DescTools)
+
+DescTools::PseudoR2(step.model_1,which="Nagelkerke")
+```
+
+# Report probability metrics for th Training Data
+
+```{r}
+library(ggplot2)
+
+# this is creating a new column in the data frame called p_hat 
+df_train_v2$p_hat <- predict(step.model_1, type = "response")
+
+#setting event values as 1, non_event values as 0
+p1 <- df_train_v2$p_hat[df_train_v2$INS == 1]
+p0 <- df_train_v2$p_hat[df_train_v2$INS == 0]
+
+#coefficient of discrimination = mean of Events - mean of Non_Events 
+coef_discrim <- mean(p1) - mean(p0)
+
+#Plot to show the histogram of the discriminiation
+ggplot(df_train_v2, aes(p_hat, fill = factor(INS))) +
+  geom_density(alpha = 0.7) +
+  scale_fill_grey(labels=c("No Purchase","Purchase")) +
+  labs(x = "Predicted Probability",
+       y="Density",
+       fill = "Outcome",
+       title = paste("Coefficient of Discrimination = ",
+                     round(coef_discrim, 3), sep = ""))+
+  theme_minimal(base_size = 14)
+
+```
+
+#Rank Order Statistics - used to compare models
+
+concordance = 0.833 - (this mean 83% of the time event values had a
+higher predicted probability than non_event values)
+
+somers D_xy =0.67
+
+```{r}
+# use Hmisc library to calcualte concordinance 
+library(Hmisc)
+
+
+# somers2(df $ p-value col , df $ Target variable) produces concordance and somers D
+Hmisc::somers2(df_train_v2$p_hat,df_train_v2$INV)
+```
+
+#Classification Metrics
+
+Classification Table (AKA Confusion Matrix) ON the Training DATA - Not
+the final matrix
+
+using a cut off of 0.5 (equally weights the events and non_events)
+
+```{r}
+df_train_v2 <- df_train_v2 %>% 
+  mutate(INS_hat=ifelse(p_hat>0.5,1,0)) # creates a new column that assign's an Event(0) if p_value > 0.5 or Non_event(0) O.W.
+
+table(df_train_v2$INS_hat,df_train_v2$INS)
+```
+
+we could loop through this or we could use the measureit function to
+calculate the Accuracy, Sensitivity, and Spcificity
+
+```{r}
+#use the library(ROCit)
+library(ROCit)
+
+logit_measure <- measureit(df_train_v2$p_hat,df_train_v2$INS,measure = c("ACC","SENS","SPEC"))
+summary(logit_measure)
+
+# this summary produces the values Cutoff, depth, TP,FP,TN,FN,Accuarcy, Sesitivity, spcificity 
+```
+
+Youden's Index (J) - optimal cut off to balance sensitivity & spcificity
+
+From ROC curve C statistic = AUC ( area under the ROC curve) optimal cut
+off = 0.311 ( recreate discrmination graph using this cut off instead of
+0.5) FPR = 0.314 TPR = 0.78
+
+```{r}
+
+# here we are calling the values (Cutoff, depth, TP,FP,TN,FN,Accuarcy, Sesitivity, spcificity) that were defined as columns in the previous code chunk
+
+youden_table <- data.frame(Cutoff = logit_measure$Cutoff,Sens=logit_measure$SENS,Spec=logit_measure$SPEC)
+
+#look at the top 10 values from this table 
+head(youden_table,n=10)
+
+# create the ROC curve
+logit_roc <- rocit(df_train_v2$p_hat,df_train_v2$INS)
+
+#Optimal Cut off value (Youdens Index)
+plot(logit_roc)$optimal
+
+# Remmember the C statistic = AUC value ( Area under the ROC curve )
+
+# plot
+```
+
+#KS Statistic
+
+```{r}
+#KS Plot
+ksplot(logit_roc)
+
+#KS stat
+ksplot(logit_roc)$'KS stat'
+
+#KS Cutoff
+ksplot(logit_roc)$'KS Cutoff'
+
+```
+
+# create a confusion matrix with a 0.2 cut off: TRAINING
+
+```{r}
+df_train_v2 <- df_train_v2 %>% 
+  mutate(INS_hat=ifelse(p_hat>0.2,1,0)) # creates a new column that assign's an Event(0) if p_value > 0.2 or Non_event(0) O.W.
+
+table(df_train_v2$INS_hat,df_train_v2$INS)
+```
+
+# Confusion Matrix: VALIDATION ( cut off = optimal 0.3113332, 0.2, 1.5)
+
+# first fix the validation data
+
+# Report probability metrics for the VALIDATION DATA
+
+```{r}
+
+# this is creating a new column in the data frame called p_hat 
+df_validate_v2$p_hat <- predict(step.model_1,newdata = df_validate_v2, type = "response")
+
+#setting event values as 1, non_event values as 0 - for the graph
+p1 <- df_validate_v2$p_hat[df_validate_v2$INS == 1]
+p0 <- df_validate_v2$p_hat[df_validate_v2$INS == 0]
+
+```
+
+# confusion matrix for optimal cut off = 0.311 (Validation DATA)
+
+```{r}
+df_validate_v2 <- df_validate_v2 %>% 
+  mutate(INS_hat=ifelse(p_hat>0.311,1,0)) # creates a new column that assign's an Event(0) if p_value > 0.311 or Non_event(0) O.W.
+
+table(df_validate_v2$INS,df_validate_v2$INS_hat)
+```
+
+Sensitivity (TPR) = 0.761
+
+Specificity (TNR) = 0.654
+
+Precision = 0.542
+
+(FPR) = 0.345
+
+# Lower Cut off to increase TPR : Cut off = 0.2 (Validation Data)
+
+```{r}
+df_validate_v2 <- df_validate_v2 %>% 
+  mutate(INS_hat=ifelse(p_hat>0.2,1,0)) # creates a new column that assign's an Event(0) if p_value > 0.2 or Non_event(0) O.W.
+
+table(df_validate_v2$INS,df_validate_v2$INS_hat)
+```
+
+Sensitivity (TPR) =0.894 Specificity (TNR) = 0.467 Precision =0.493
+FPR=0.533
+
+# Lower Cut off to increase TPR : Cut off = 0.15
+
+```{r}
+df_validate_v2 <- df_validate_v2 %>% 
+  mutate(INS_hat=ifelse(p_hat>0.15,1,0)) # creates a new column that assign's an Event(0) if p_value > 0.15 or Non_event(0) O.W.
+
+table(df_validate_v2$INS,df_validate_v2$INS_hat)
+```
+
+Sensitivity (TPR)=0.941 Specificity (TNR) = 0.328 Precision =0.429
+FPR=0.672
+
+# lift calculation
+
+```{r}
+#df_validate_v2$p_hat <- predict(step.model_1, newdata = df_validate_v2, type =“response”)
+logit_roc.val <- rocit(df_validate_v2$p_hat, df_validate_v2$INS)
+
+# lift table 
+logit_lift <- gainstable(logit_roc.val)
+print(logit_lift)
+```
+
+# Lift Chart
+
+```{r}
+library(tidyr)
+library(ROCit)
+library(ROCR)
+library(ggplot2)
+
+logit_roc <- rocit(df_validate_v2$p_hat, df_validate_v2$INS)
+logit_lift <- gainstable(logit_roc)
+
+# Lift Figure - ggplot
+lift_df <- data.frame(
+  Bucket     = logit_lift$Bucket,
+  Obs        = logit_lift$Obs,
+  CObs       = logit_lift$CObs,
+  Depth      = logit_lift$Depth,
+  Resp       = logit_lift$Resp,
+  CResp      = logit_lift$CResp,
+  RespRate   = logit_lift$RespRate,
+  CRespRate  = logit_lift$CRespRate,
+  CCapRate   = logit_lift$CCapRate,
+  Lift       = logit_lift$Lift,
+  CLift      = logit_lift$CLift
+)
+lift_long <- lift_df %>%
+  pivot_longer(cols = c(Lift, CLift),
+               names_to = "Metric",
+               values_to = "Value")
+lift_long$Metric <- as.character(lift_long$Metric)
+lift_long$Metric[lift_long$Metric == "CLift"] <- "Cumulative Lift"
+lift_long$Metric <- factor(lift_long$Metric, levels = c("Cumulative Lift", "Lift"))
+
+ggplot(lift_long, aes(x = Depth*100, y = Value, color = Metric)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_color_grey(start = 0.2, end = 0.8) +
+  labs(
+    x = "Population Depth (%)",
+    y = "Lift / Cumulative Lift",
+    color = ""
+  ) +
+  scale_x_continuous(breaks = pretty(lift_long$Depth*100, n = 10)) +
+  scale_y_continuous(breaks = pretty(lift_long$Value, n = 10))  +
+  theme_minimal(base_size = 14)
+```
+
+```{r}
+View(df_validate_v2$p_hat)
+```
