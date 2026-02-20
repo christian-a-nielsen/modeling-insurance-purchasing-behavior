@@ -1,0 +1,371 @@
+---
+title: "Machine Learning HW 3 - Final"
+author: "HW Team 1"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Import
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Load packages
+library(dplyr)
+library(readr)
+library(mice)
+library(xgboost)
+library(DiagrammeR)
+library(caret)
+library(pROC)
+library(ROCR)
+library(car)
+library(randomForest)
+library(ROCit)
+library(ggplot2)
+library(tidyr)
+library(earth) 
+library(mgcv)
+library(reticulate)
+library(ebm)
+library(ggplot2)
+
+# read in data
+setwd('/Users/CHRISTIAN/MSA26/Homework3_ML')
+
+ins_t <- read_csv("insurance_t.csv")
+ins_v <- read_csv("insurance_v.csv")
+
+```
+
+# Impute Missing Values
+```{r, include = FALSE}
+# combine data for imputation
+ins_t$set_flag <- 'train'
+ins_v$set_flag <- 'val'
+
+target_train <- ins_t$INS
+target_val <- ins_v$INS
+
+ins_t <- select(ins_t, -INS)
+ins_v <- select(ins_v, -INS)
+
+full_data <- bind_rows(ins_t, ins_v)
+
+# Variable definitions
+cont_vars <- c("ACCTAGE", "DDABAL", "DEPAMT", "CHECKS", "NSFAMT", "SAVBAL", 
+               "ATMAMT", "CDBAL", "IRABAL", "INVBAL", "MMBAL", "CCBAL", 
+               "INCOME", "LORES", "HMVAL", "AGE", "CRSCORE", "POSAMT", 
+               "DEP", "PHONE", "TELLER", "POS", "MMCRED", "NSF", "CCPURC")
+
+disc_vars <- c("BRANCH")
+binary_vars <- c("DDA", "DIRDEP", "SAV", "ATM", "CD", "IRA", "INV", 
+                 "MM", "CC", "SDB", "INAREA") # INS removed from here
+
+# Type conversion on full data 
+full_data <- full_data %>%
+  mutate(across(all_of(binary_vars), ~ factor(.))) %>%
+  mutate(across(all_of(disc_vars), ~ factor(.)))
+
+# Create missing flags
+na_cols <- names(which(colSums(is.na(full_data)) > 0))
+full_data <- full_data %>%
+  mutate(across(all_of(na_cols),
+                ~ as.integer(is.na(.)),
+                .names = "{.col}_miss")) %>%
+  mutate(across(ends_with("_miss"), ~ factor(.)))
+
+# MICE
+
+# Define rows to ignore
+ignore_vec <- full_data$set_flag == 'val'
+
+# Setup methods
+meth <- make.method(full_data)
+pred_mat <- make.predictorMatrix(full_data)
+
+# Don't impute the flag or ID columns
+vars_to_skip <- c("set_flag", names(full_data)[grep("_miss", names(full_data))])
+meth[vars_to_skip] <- ""
+pred_mat[, vars_to_skip] <- 0
+
+# Assign methods
+meth[names(meth) %in% cont_vars & names(meth) %in% na_cols] <- "pmm"
+meth[names(meth) %in% binary_vars & names(meth) %in% na_cols] <- "logreg"
+meth[names(meth) %in% disc_vars & names(meth) %in% na_cols] <- "polyreg"
+
+# MICE
+imp <- mice(full_data,
+            m = 5,             
+            method = meth,
+            ignore = ignore_vec, # ignore training but still impute 
+            maxit = 10,
+            seed = 123,
+            printFlag = FALSE)
+
+# complete data and split back
+full_imputed <- complete(imp)
+
+ins_t_imputed <- full_imputed %>% filter(set_flag == 'train') %>% select(-set_flag)
+ins_v_imputed <- full_imputed %>% filter(set_flag == 'val') %>% select(-set_flag)
+
+ins_t_imputed$INS <- as.factor(target_train)
+ins_v_imputed$INS <- as.factor(target_val)
+```
+
+
+# VIF check on all vars to identify multicolinearity
+```{r}
+# from hw 1 and 2 know we need to drop HMVAL
+ins_t_imputed <- select(ins_t_imputed, -HMVAL)
+ins_v_imputed <- select(ins_v_imputed, -HMVAL)
+```
+# Models
+```{r}
+#  comparison dataframe
+model_comparison <- data.frame(
+  Model = character(),
+  AUC = numeric(),
+  Accuracy = numeric(),
+  Sensitivity = numeric(),
+  Specificity = numeric(),
+  Precision = numeric(),
+  F1 = numeric(),
+  Lift_Top10 = numeric(),
+  CumLift_Top30 = numeric(),
+  stringsAsFactors = FALSE
+)
+
+evaluate_model <- function(model_name, prob_vec, actual_labels, compare_df, cutoff = NULL) {
+  
+  roc_obj <- roc(actual_labels, prob_vec, quiet = TRUE)
+  auc_val <- as.numeric(auc(roc_obj))
+  
+  if (is.null(cutoff)) {
+    coords_opt <- coords(roc_obj, "best", best.method = "youden", transpose = FALSE)
+    cutoff <- coords_opt$threshold
+  } 
+  
+  pred_class <- factor(ifelse(prob_vec >= cutoff, 1, 0), levels = c("0", "1"))
+  actual_class <- factor(actual_labels, levels = c("0", "1"))
+  
+  cm <- confusionMatrix(pred_class, actual_class, positive = "1")
+  
+  # Lifts
+  res_df <- data.frame(prob = prob_vec, actual = as.numeric(as.character(actual_labels)))
+  res_df <- res_df[order(-res_df$prob), ]
+  base_rate <- mean(res_df$actual)
+  
+  top_10_n <- ceiling(0.1 * nrow(res_df))
+  lift_10 <- mean(res_df$actual[1:top_10_n]) / base_rate
+  
+  top_30_n <- ceiling(0.3 * nrow(res_df))
+  lift_30 <- mean(res_df$actual[1:top_30_n]) / base_rate
+  
+
+  new_row <- data.frame(
+    Model = model_name,
+    AUC = round(auc_val, 4),
+    Accuracy = round(cm$overall["Accuracy"], 4),
+    Sensitivity = round(cm$byClass["Sensitivity"], 4),
+    Specificity = round(cm$byClass["Specificity"], 4),
+    Precision = round(cm$byClass["Precision"], 4),
+    F1 = round(cm$byClass["F1"], 4),
+    Lift_Top10 = round(lift_10, 4),
+    CumLift_Top30 = round(lift_30, 4),
+    cutoff_used = round(cutoff, 4)
+  )
+  
+  
+  return(list(df = rbind(compare_df, new_row), cutoff = cutoff))
+}
+
+
+
+############  GAM ############ 
+# Using variables from HW 1
+sig_continuous <- c("ACCTAGE", "DDABAL", "CHECKS", "SAVBAL", "ATMAMT", "TELLER", "CDBAL", "CCBAL", "PHONE")
+sig_categorical <- c("DDA", "CD", "IRA", "INV", "MM", "CC", "BRANCH")
+
+formula_str_final <- paste0(
+  "INS", " ~ ",
+  paste(paste0("s(", sig_continuous, ")"), collapse = " + "), " + ",
+  paste(sig_categorical, collapse = " + "), " + NSF"
+)
+
+final.gam <- mgcv::gam(as.formula(formula_str_final),
+               data = ins_t_imputed, family = binomial(link = 'logit'), method="REML")
+
+# Train
+gam_pred_t <- as.numeric(predict(final.gam, newdata = ins_t_imputed, type = "response"))
+res_gam <- evaluate_model("GAM (Train)", gam_pred_t, ins_t_imputed$INS, model_comparison, cutoff = NULL)
+model_comparison <- res_gam$df
+gam_cutoff <- res_gam$cutoff
+
+# Val
+gam_pred_v <- as.numeric(predict(final.gam, newdata = ins_v_imputed, type = "response"))
+res_gam_v <- evaluate_model("GAM (Val)", gam_pred_v, ins_v_imputed$INS, model_comparison, cutoff = gam_cutoff)
+model_comparison <- res_gam_v$df
+
+############  MARS ############ 
+mars_model <- earth(
+  INS ~ .,             
+  data = ins_t_imputed,
+  degree = 1,
+  glm = list(family = binomial)  
+)
+
+# Training
+mars_pred_t <- predict(mars_model, newdata = ins_t_imputed, type = "response")[,1]
+res_mars <- evaluate_model("MARS (Train)", mars_pred_t, ins_t_imputed$INS, model_comparison, cutoff = NULL)
+model_comparison <- res_mars$df
+mars_cutoff <- res_mars$cutoff
+
+#  Validation
+mars_pred_v <- predict(mars_model, newdata = ins_v_imputed, type = "response")[,1]
+res_mars_v <- evaluate_model("MARS (Val)", mars_pred_v, ins_v_imputed$INS, model_comparison, cutoff = mars_cutoff)
+model_comparison <- res_mars_v$df
+
+############ Random forest ############ 
+set.seed(67)
+
+rf_model <- randomForest(INS ~ ., data = ins_t_imputed, ntree = 500, mtry = 10, nodesize = 5, importance = TRUE)
+
+# Train
+rf_pred_t <- predict(rf_model, type = "prob")[, 2]
+res_rf <- evaluate_model("RF (Train)", rf_pred_t, ins_t_imputed$INS, model_comparison, cutoff = 0.370)
+model_comparison <- res_rf$df
+rf_cutoff <- res_rf$cutoff
+
+# Val 
+rf_pred_v <- predict(rf_model, newdata = ins_v_imputed, type = "prob")[, 2]
+res_rf_v <- evaluate_model("RF (Val)", rf_pred_v, ins_v_imputed$INS, model_comparison, cutoff = 0.370)
+model_comparison <- res_rf_v$df
+
+
+############  XGBoost ############ 
+t_mat <- model.matrix(INS ~ ., data = ins_t_imputed)[, -1]
+v_mat <- model.matrix(INS ~ ., data = ins_v_imputed)[, -1]
+t_label <- as.numeric(ins_t_imputed$INS) - 1
+
+# Use the selected features from hw 2
+selected_features <- c("SAVBAL", "DDABAL", "CDBAL", "DDA1", "MMBAL", "MM1", "ACCTAGE", "ATMAMT", "CHECKS")
+
+final_xgb <- xgboost(
+  data = t_mat[, selected_features],
+  label = t_label,
+  nrounds = 100,
+  eta = 0.05,
+  max_depth = 5,
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  verbose = 0
+)
+
+# Train
+xgb_pred_t <- predict(final_xgb, t_mat[, selected_features])
+res_xgb <- evaluate_model("XGB (Train)", xgb_pred_t, ins_t_imputed$INS, model_comparison, cutoff = 0.339)
+model_comparison <- res_xgb$df
+xgb_cutoff <- res_xgb$cutoff
+
+# Val
+xgb_pred_v <- predict(final_xgb, v_mat[, selected_features])
+res_xgb_v <- evaluate_model("XGB (Val)", xgb_pred_v, ins_v_imputed$INS, model_comparison, cutoff = 0.339)
+model_comparison <- res_xgb_v$df
+
+############  EBM ############ 
+py_install("interpret")
+py_config()
+ebm_model <- ebm(INS ~ ., data = ins_t_imputed)
+
+# Train
+ebm_pred_t <- predict(ebm_model, ins_t_imputed, type = "response")[,2]
+res_ebm <- evaluate_model("EBM (Train)", ebm_pred_t, ins_t_imputed$INS, model_comparison, cutoff = 0.333)
+model_comparison <- res_ebm$df
+ebm_cutoff <- res_ebm$cutoff
+
+# Val
+ebm_pred_v <- predict(ebm_model, newdata = ins_v_imputed, type = "response")[, 2]
+res_ebm_v <- evaluate_model("EBM (Val)", ebm_pred_v, ins_v_imputed$INS, model_comparison, cutoff = 0.333)
+model_comparison <- res_ebm_v$df
+
+############ Print final table ############ 
+print(model_comparison)
+
+```
+
+```{r}
+validation_metrics <- model_comparison[seq(2, nrow(model_comparison), by = 2), ]
+validation_metrics
+```
+
+```{r}
+# Build plotting data frame
+ppd_df <- data.frame(
+  pred_prob = rf_pred_v,
+  INS = factor(ins_v_imputed$INS, levels = c(0, 1),
+               labels = c("Non-purchaser", "Purchaser"))
+)
+
+# Density plot of predicted probabilities by actual class
+ggplot(ppd_df, aes(x = pred_prob, fill = INS)) +
+  geom_density(alpha = 0.55, color = NA) +
+  scale_fill_manual(
+    values = c("Non-purchaser" = "#B0B4BB",  
+               "Purchaser"     = "#2F5597")   
+  ) +
+  labs(
+    x = "Predicted probability of purchase",
+    y = "Density",
+    fill = "Actual class"
+  ) +
+  theme_classic()
+```
+
+```{r}
+# Coefficient of Discrimination
+coef_discrimination <- mean(rf_pred_v[ins_v_imputed$INS == 1]) -
+                       mean(rf_pred_v[ins_v_imputed$INS == 0])
+
+coef_discrimination
+
+```
+
+
+```{r}
+library(pdp)
+
+# Partial dependence for "age" on probability of being a Purchaser
+pdp_age <- partial(
+  object   = rf_model,
+  pred.var = "ACCTAGE",
+  train    = ins_t_imputed,
+  which.class = "1",
+  prob     = TRUE
+)
+
+ggplot(pdp_age, aes(x = ACCTAGE, y = yhat)) +
+  geom_line(linewidth = 1, color = "#2F5597") +  
+  labs(
+    x = "Account age (years)",
+    y = "Partial dependence") +
+  theme_classic()
+```
+
+```{r}
+# 1. Predicted probabilities on the validation set
+pred_probs_val <- predict(rf_model, ins_v_imputed, type = "prob")[,"1"]
+
+pred <- prediction(pred_probs_val, ins_v_imputed$INS)
+perf <- performance(pred, "tpr", "fpr")
+plot(perf, col = "black", lwd = 2,
+     xlab = "1 - Specificity (False Positive Rate)",
+     ylab = "Sensitivity (True Positive Rate)")
+polygon(c(0, perf@x.values[[1]], 1), c(0, perf@y.values[[1]], 0), col = "lightgray", border = NA)
+abline(a = 0, b = 1, lty = 2, col = "black")
+auc <- performance(pred, "auc")
+auc_value <- auc@y.values[[1]]
+text(x = 0.6, y = 0.2, labels = paste("AUC =", round(auc_value, 4)), col = "black", cex = 1.2)
+```
+
+
