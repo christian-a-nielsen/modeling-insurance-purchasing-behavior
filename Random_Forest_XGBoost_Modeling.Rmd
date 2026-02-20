@@ -1,0 +1,539 @@
+---
+title: "Machine Learning HW 2"
+author: "HW Team 1"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+### Imports and read in data
+
+```{r, include=FALSE}
+# Load packages
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(readr)
+library(mice)
+library(xgboost)
+library(DiagrammeR)
+library(caret)
+library(pROC)
+library(ROCR)
+library(car)
+library(randomForest)
+library(ROCit)
+library(ggplot2)
+library(tidyr)
+```
+
+```{r, include=FALSE}
+setwd('~/MSA/Fall/Machine Learning/Homework2_ML')
+# read in training data set
+ins_t <- read_csv("insurance_t.csv")
+```
+
+### Impute Missing Values
+```{r, include = FALSE}
+# Numeric variables and vars with > 10 levels are considered continuous
+cont_vars <- c("ACCTAGE", "DDABAL", "DEPAMT", "CHECKS", "NSFAMT", "SAVBAL", 
+               "ATMAMT", "CDBAL", "IRABAL", "INVBAL", "MMBAL", "CCBAL", 
+               "INCOME", "LORES", "HMVAL", "AGE", "CRSCORE", "POSAMT", "DEP", "PHONE", "TELLER", "POS", "MMCRED", "NSF", "CCPURC" )
+
+# Non-binary categorical variables
+disc_vars <- c("BRANCH")
+
+# Binary variables
+binary_vars <- c("DDA", "DIRDEP", "SAV", "ATM", "CD", "IRA", "INV", "MM", "CC", "SDB", "INAREA", "INS")
+
+# Set categorical variables as factor
+ins_t <- ins_t %>%
+  mutate(across(all_of(binary_vars), ~ factor(.)))
+
+ins_t <- ins_t %>%
+  mutate(across(all_of(disc_vars), ~ factor(.)))
+
+# identify columns with any missing values
+na_cols <- names(which(colSums(is.na(ins_t)) > 0))
+
+# create missingness flags to show where values were imputed
+ins_t <- ins_t %>%
+  mutate(across(all_of(na_cols),
+                ~ as.integer(is.na(.)),
+                .names = "{.col}_miss")) %>%
+  mutate(across(ends_with("_miss"), ~ factor(.)))
+
+# set up the imputation methods 
+meth <- make.method(ins_t)
+cont_to_impute <- na_cols[na_cols %in% cont_vars]
+binary_to_impute <- na_cols[na_cols %in% binary_vars]
+disc_to_impute <- na_cols[na_cols %in% disc_vars]
+
+# assing imputation methods based on variable type
+meth[cont_to_impute] <- "pmm"     
+meth[binary_to_impute] <- "logreg" 
+meth[disc_to_impute] <- "polyreg" 
+
+# no imputation needed for flag variables
+meth[!(names(meth) %in% na_cols)] <- ""
+
+# run imputation
+imp <- mice(ins_t,
+            m = 5,            
+            method = meth,
+            maxit = 10,       
+            seed = 123,
+            printFlag = FALSE) 
+
+# final imputed data set
+ins_t_imputed <- complete(imp)
+```
+
+
+### VIF check on all vars to identify multicolinearity
+```{r}
+# find all predictors
+all_predictors <- c(cont_vars, disc_vars, binary_vars)
+var_to_drop <- "INS" 
+filtered_predictors <- setdiff(all_predictors, var_to_drop)
+
+# run model to find VIF scores 
+vif_formula_str <- paste0("INS ~ ", paste(filtered_predictors, collapse = " + "))
+vif_model <- glm(as.formula(vif_formula_str),
+                 data = ins_t_imputed, 
+                 family = binomial(link = 'logit'))
+
+# Calculate and print VIF scores
+vif_scores <- vif(vif_model)
+print(vif_scores)
+
+# HMVAL has adjusted vif > 5, rerun without
+var_to_drop <- c("INS", "HMVAL")
+filtered_predictors <- setdiff(all_predictors, var_to_drop)
+vif_formula_str <- paste0("INS ~ ", paste(filtered_predictors, collapse = " + "))
+vif_model <- glm(as.formula(vif_formula_str),
+                 data = ins_t_imputed, 
+                 family = binomial(link = 'logit'))
+vif_scores <- vif(vif_model)
+print(vif_scores)
+# all adjusted vif now less than 5 
+
+# drop HMVAL
+ins_t_imputed <- select(ins_t_imputed, -HMVAL)
+```
+
+
+# Random Forest
+
+```{r}
+set.seed(67)
+
+# Stratified 5-folds on the target
+folds <- createFolds(ins_t_imputed$INS, k = 5, returnTrain = FALSE)
+
+# Define grid
+ntree_grid    <- c(200, 500, 1000)
+mtry_grid     <- c(10, 17, 25)
+nodesize_grid <- c(1, 3, 5)
+
+grid <- expand.grid(ntree = ntree_grid,
+                    mtry = mtry_grid,
+                    nodesize = nodesize_grid)
+
+# Create a dataframe to store results of grid search
+results <- data.frame(ntree = integer(), mtry = integer(), nodesize = integer(),
+                      mean_auc = numeric(), sd_auc = numeric(), stringsAsFactors = FALSE)
+
+# Choose the positive class (INS = 1)
+ins_levels <- levels(ins_t_imputed$INS)
+pos_class  <- if ("1" %in% ins_levels) "1" else tail(ins_levels, 1)
+
+for (i in seq_len(nrow(grid))) {
+  params <- grid[i, ]
+  aucs <- numeric(length(folds))
+
+  for (f in seq_along(folds)) {
+    # Fix the RNG state for this (i, f) combination
+    set.seed(1000 * i + f)
+    idx_val <- folds[[f]]
+    train   <- ins_t_imputed[-idx_val, ]
+    val     <- ins_t_imputed[idx_val, ]
+
+    rf <- randomForest(
+      INS ~ ., data = train,
+      ntree = params$ntree,
+      mtry = params$mtry,
+      nodesize = params$nodesize,
+      replace = TRUE, importance = FALSE
+    )
+
+    # Probabilities for the positive class
+    prob_mat <- predict(rf, newdata = val, type = "prob")
+    prob_pos <- prob_mat[, pos_class]
+
+    roc_obj <- roc(response = val$INS, predictor = prob_pos,
+                   levels = ins_levels, positive = pos_class, quiet = TRUE)
+    aucs[f] <- as.numeric(auc(roc_obj))
+  }
+
+  results[i, ] <- c(params$ntree, params$mtry, params$nodesize,
+                    mean(aucs, na.rm = TRUE), sd(aucs, na.rm = TRUE))
+}
+
+# Best by mean AUC
+best_idx <- which.max(results$mean_auc)
+best_params <- results[best_idx, ]
+best_params
+
+# Fit final model on full data with best params
+rf_model <- randomForest(
+  INS ~ ., data = ins_t_imputed,
+  ntree = best_params$ntree,
+  mtry = best_params$mtry,
+  nodesize = best_params$nodesize,
+  replace = TRUE, importance = TRUE
+)
+```
+
+
+```{r}
+# Plot variable importance
+varImpPlot(rf_model, sort = TRUE, n.var = 15, main = "Random Forest: Variables vs Random Baseline")
+```
+
+```{r}
+# Probabilities for class "2"
+pred_probs_vec <- predict(rf_model, type = "prob")[, 2]
+
+labels_vec <- as.numeric(as.character(ins_t_imputed$INS))
+
+pred <- prediction(pred_probs_vec, labels_vec)
+perf <- performance(pred, "tpr", "fpr")
+
+# Plot the ROC curve
+plot(perf, col = "black", lwd = 2,
+     xlab = "1 - Specificity (False Positive Rate)", ylab = "Sensitivity (True Positive Rate)")
+
+x_vals <- perf@x.values[[1]]
+y_vals <- perf@y.values[[1]]
+polygon(c(0, x_vals, 1), c(0, y_vals, 0),
+        col = "lightgray", border = NA)
+
+abline(a = 0, b = 1, lty = 2, col = "black")
+
+auc <- performance(pred, "auc")
+auc_value <- auc@y.values[[1]]
+text(0.6, 0.2, paste("AUC =", round(auc_value, 4)),
+     col = "black", cex = 1.2)
+```
+
+```{r}
+# Create lift plot
+logit_roc <- rocit(score = pred_probs_vec, class = ins_t_imputed$INS)
+logit_lift <- gainstable(logit_roc)
+print(logit_lift)
+
+lift_df <- data.frame(
+  Bucket     = logit_lift$Bucket,
+  Obs        = logit_lift$Obs,
+  CObs       = logit_lift$CObs,
+  Depth      = logit_lift$Depth,
+  Resp       = logit_lift$Resp,
+  CResp      = logit_lift$CResp,
+  RespRate   = logit_lift$RespRate,
+  CRespRate  = logit_lift$CRespRate,
+  CCapRate   = logit_lift$CCapRate,
+  Lift       = logit_lift$Lift,
+  CLift      = logit_lift$CLift
+)
+lift_long <- lift_df %>%
+  pivot_longer(cols = c(Lift, CLift),
+               names_to = "Metric",
+               values_to = "Value")
+lift_long$Metric <- as.character(lift_long$Metric)
+lift_long$Metric[lift_long$Metric == "CLift"] <- "Cumulative Lift"
+lift_long$Metric <- factor(lift_long$Metric, levels = c("Cumulative Lift", "Lift"))
+ggplot(lift_long, aes(x = Depth*100, y = Value, color = Metric)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_color_grey(start = 0.2, end = 0.8) +
+  labs(
+    x = "Population Depth (%)",
+    y = "Lift / Cumulative Lift",
+    color = ""
+  ) +
+  scale_x_continuous(breaks = pretty(lift_long$Depth*100, n = 10)) +
+  scale_y_continuous(breaks = pretty(lift_long$Value, n = 10))  +
+  theme_minimal(base_size = 14)
+```
+
+
+```{r}
+# Other perfromance metrics
+perf <- performance(pred, "tpr", "fpr")
+
+tpr <- perf@y.values[[1]]
+fpr <- perf@x.values[[1]]
+thresholds <- perf@alpha.values[[1]]
+
+specificity <- 1 - fpr
+youden_j <- tpr + specificity - 1
+
+best_index <- which.max(youden_j)
+best_threshold <- thresholds[best_index]
+best_tpr <- tpr[best_index]
+best_fpr <- fpr[best_index]
+
+# Optimal cutoff
+best_threshold
+```
+
+```{r}
+# Confusion matrix
+pred_classes_opt <- ifelse(pred_probs_vec >= best_threshold, 1, 0)
+cm <- table(Predicted = pred_classes_opt, Actual = labels_vec); cm
+```
+
+```{r}
+# Extract counts
+TP <- cm["1", "1"]
+TN <- cm["0", "0"]
+FP <- cm["1", "0"]
+FN <- cm["0", "1"]
+
+# Metrics
+accuracy  <- (TP + TN) / sum(cm)
+precision <- TP / (TP + FP)
+recall    <- TP / (TP + FN)
+
+# Display results
+cat("Accuracy :", round(accuracy, 3), "\n")
+cat("Recall   :", round(recall, 3), "\n")
+cat("Precision:", round(precision, 4), "\n")
+```
+
+
+
+```{r}
+imp <- importance(rf_model)
+imp_df <- data.frame(
+  Variable = rownames(imp),
+  MeanDecreaseAccuracy = imp[, "MeanDecreaseAccuracy"]
+)
+
+# Top 10 most important features
+top10_imp <- imp_df[order(imp_df$MeanDecreaseAccuracy, decreasing = TRUE), ][1:10, ]
+top10_imp
+```
+
+
+# Try adding a random variable
+
+```{r}
+# Create random variable
+set.seed(12345)
+ins_t_imputed_with_random <- cbind(ins_t_imputed, random_var = rnorm(nrow(ins_t_imputed)))
+set.seed(67)
+rf_model_with_random <- randomForest(INS ~ ., data = ins_t_imputed_with_random, 
+                                     ntree = best_params$ntree,
+                                     mtry = best_params$mtry,
+                                     nodesize = best_params$nodesize,
+                                     replace = TRUE, importance = TRUE)
+```
+
+# Variable importance
+```{r}
+imp <- importance(rf_model_with_random)
+
+# If you want descending (most important first)
+imp_sorted_desc <- imp[order(imp[, "MeanDecreaseAccuracy"], decreasing = TRUE), ]
+imp_sorted_desc
+```
+
+# XGBOOST
+```{r} 
+# Get data model ready
+ins_t_x <- model.matrix(INS ~ ., data = ins_t_imputed)[, -1]
+ins_t_y <- as.numeric(ins_t_imputed$INS) - 1
+
+# Build initial model using defaults for hyperparameters
+set.seed(12345)
+xgb <- xgboost(
+  data = ins_t_x, label = ins_t_y, 
+  nrounds = 100,
+  objective = "binary:logistic", eval_metric = "auc", verbose = 0
+)
+
+# tune the model parameters  to find best model based on AUC, using cross validation
+tune_grid <- expand.grid(
+  nrounds = c(100, 500),
+  eta = c(0.05, 0.1, 0.2),
+  max_depth = c(3,5,7),
+  gamma = c(0),
+  colsample_bytree = c(0.7, 1),
+  min_child_weight = c(1, 3),
+  subsample =c(0.5, 0.75, 1)  
+)
+
+xgb.caret <- 
+  train(
+    x = ins_t_x, y = as.factor(ifelse(ins_t_y == 1, "Yes", "No")),
+    method = "xgbTree",
+    tuneGrid = tune_grid,
+    trControl = trainControl(
+      method = 'cv', 
+      number = 5, 
+      classProbs = TRUE, 
+      summaryFunction = twoClassSummary,
+      verboseIter = FALSE
+    ),
+    metric = 'ROC'
+  )
+
+
+```
+
+Best tune: 
+   nrounds max_depth  eta gamma colsample_bytree min_child_weight subsample
+45     100         5 0.05     0                1                3      0.75
+
+### XGBOOST BEST MODEL FEATURE IMPORTANCE
+```{r}
+# Create random variable
+set.seed(12345)
+ins_t_x_with_random <- cbind(ins_t_x, random_var = rnorm(nrow(ins_t_x)))
+
+# pull off best parameters from grid search and create model
+final_params <- xgb.caret$bestTune
+
+final_xgb_with_random <- xgboost(
+  data = ins_t_x_with_random, 
+  label = ins_t_y,
+  nrounds = final_params$nrounds,
+  eta = final_params$eta,
+  max_depth = final_params$max_depth,
+  gamma = final_params$gamma,
+  colsample_bytree = final_params$colsample_bytree,
+  min_child_weight = final_params$min_child_weight,
+  subsample = final_params$subsample,
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  verbose = 0
+)
+
+# Find variable importance
+importance_matrix <- xgb.importance(feature_names = colnames(ins_t_x_with_random), model = final_xgb_with_random)
+print(importance_matrix)
+
+# Keep only features with Gain > random variable
+random_importance <- importance_matrix$Gain[importance_matrix$Feature == "random_var"]
+selected_features <- importance_matrix$Feature[importance_matrix$Gain > random_importance]
+selected_features <- setdiff(selected_features, "random_var")
+ins_t_x_selected <- ins_t_x[, selected_features]
+```
+
+``` {r}
+# retrain model with final feature selection
+final_xgb <- xgboost(
+  data = ins_t_x_selected,
+  label = ins_t_y,
+  nrounds = final_params$nrounds,
+  eta = final_params$eta,
+  max_depth = final_params$max_depth,
+  gamma = final_params$gamma,
+  colsample_bytree = final_params$colsample_bytree,
+  min_child_weight = final_params$min_child_weight,
+  subsample = final_params$subsample,
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  verbose = 0
+)
+
+#print variable importance
+importance_matrix <- xgb.importance(feature_names = colnames(ins_t_x_selected), model = final_xgb)
+print(importance_matrix)
+xgb.plot.importance(importance_matrix)
+
+pred_probs <- predict(final_xgb, ins_t_x_selected)
+
+# ROC curve
+pred <- prediction(pred_probs, ins_t_y)
+perf <- performance(pred, "tpr", "fpr")
+plot(perf, col = "black", lwd = 2,
+     xlab = "1 - Specificity (False Positive Rate)",
+     ylab = "Sensitivity (True Positive Rate)")
+polygon(c(0, perf@x.values[[1]], 1), c(0, perf@y.values[[1]], 0), col = "lightgray", border = NA)
+abline(a = 0, b = 1, lty = 2, col = "black")
+
+auc <- performance(pred, "auc")
+auc_value <- auc@y.values[[1]]
+text(x = 0.6, y = 0.2, labels = paste("AUC =", round(auc_value, 4)), col = "black", cex = 1.2)
+
+# Other metrics
+
+# Find optimal cutoff using Youden's J statistic
+roc_obj <- roc(ins_t_y, pred_probs)
+opt_cutoff <- coords(roc_obj, "best", best.method = "youden", transpose = FALSE)
+opt_cutoff
+# This shows the optimal threshold and associated sensitivity/specificity
+
+# Classify predictions using that threshold
+pred_class <- ifelse(pred_probs > opt_cutoff$threshold, 1, 0)
+
+# Convert to factors for confusionMatrix
+pred_factor <- factor(pred_class, levels = c(0,1))
+actual_factor <- factor(ins_t_y, levels = c(0,1))
+
+# Compute confusion matrix and performance metrics
+cm <- confusionMatrix(pred_factor, actual_factor, positive = "1")
+cm
+
+accuracy  <- cm$overall["Accuracy"]
+precision <- cm$byClass["Precision"]
+recall    <- cm$byClass["Recall"]
+f1_score  <- cm$byClass["F1"]
+
+metrics_xgb <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1 Score", "AUC", "Optimal Cutoff"),
+  Value = c(round(accuracy, 3), round(precision, 3), round(recall, 3),
+            round(f1_score, 3), round(auc_value, 3), round(opt_cutoff$threshold, 3))
+)
+metrics_xgb
+
+logit_roc <- rocit(score = pred_probs, class = ins_t_y)
+logit_lift <- gainstable(logit_roc)
+print(logit_lift)
+
+# Lift Figure - ggplot
+lift_df <- data.frame(
+  Bucket     = logit_lift$Bucket,
+  Obs        = logit_lift$Obs,
+  CObs       = logit_lift$CObs,
+  Depth      = logit_lift$Depth,
+  Resp       = logit_lift$Resp,
+  CResp      = logit_lift$CResp,
+  RespRate   = logit_lift$RespRate,
+  CRespRate  = logit_lift$CRespRate,
+  CCapRate   = logit_lift$CCapRate,
+  Lift       = logit_lift$Lift,
+  CLift      = logit_lift$CLift
+)
+lift_long <- lift_df %>%
+  pivot_longer(cols = c(Lift, CLift),
+               names_to = "Metric",
+               values_to = "Value")
+lift_long$Metric <- as.character(lift_long$Metric)
+lift_long$Metric[lift_long$Metric == "CLift"] <- "Cumulative Lift"
+lift_long$Metric <- factor(lift_long$Metric, levels = c("Cumulative Lift", "Lift"))
+
+ggplot(lift_long, aes(x = Depth*100, y = Value, color = Metric)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_color_grey(start = 0.2, end = 0.8) +
+  labs(
+    x = "Population Depth (%)",
+    y = "Lift / Cumulative Lift",
+    color = ""
+  ) +
+  scale_x_continuous(breaks = pretty(lift_long$Depth*100, n = 10)) +
+  scale_y_continuous(breaks = pretty(lift_long$Value, n = 10))  +
+  theme_minimal(base_size = 14)
+```
